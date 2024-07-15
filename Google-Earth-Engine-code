@@ -1,0 +1,254 @@
+var DWcollection = ee.ImageCollection("GOOGLE/DYNAMICWORLD/V1");
+var UGSrasterfile;
+var UGSvectorfile;
+
+//-----------------The methodology for mapping Urban Green Spaces-----------------
+function mapUGS(AOI, DOI, minsize, neighborhoodthreshold) {
+  //1. Get area of interest
+  var AOI_geometry = AOI;
+  Map.centerObject(AOI_geometry);
+  //Map.setCenter(-110.92413044878936, 32.224513435980526, 14);
+  
+  //2. Get date of interest
+  var date_of_interest = DOI;
+  var startDate = date_of_interest.advance(-8, 'week');
+  var endDate = date_of_interest.advance(8, 'week');
+  
+  //3. Filter collections to study area and periods surrounding date of interest
+  function filtertoDOIandAOI(imgcol){
+    var filtered = imgcol.filter(ee.Filter.date(startDate, endDate))
+                      .filter(ee.Filter.bounds(AOI_geometry));
+    return filtered;
+  }
+  var dw = filtertoDOIandAOI(DWcollection);
+  var LULC = dw.select('label').reduce(ee.Reducer.mode()).clip(AOI_geometry);
+
+  //4. Create an urban mask
+  var urbanareas = LULC.eq(6); //built-up area
+  
+  //5. Map green spaces (trees, grass, and shrub and scrub)
+  var greenspaces = LULC.eq(1) //trees
+                        .or(LULC.eq(2)); //grass
+  var greenspacesmasked = greenspaces.selfMask().rename('greenspaces');
+  
+  //6. Uniquely label the green spaces image objects.
+  var greenspacesobjects = greenspaces.connectedComponents({
+    connectedness: ee.Kernel.plus(2),
+    maxSize: 600
+  });
+  
+  //7. Get area of each green spaces object
+  var greenspacesobjectsSize = greenspacesobjects.select('labels').connectedPixelCount({
+                      maxSize: 1000, eightConnected: true
+                    });
+  var greenspacesobjectsArea = greenspacesobjectsSize.multiply(100).updateMask(greenspacesobjects.select("label_mode"));
+               
+  //8. Filter green spaces objects based on area (in meter squared)
+  var greenspacesobjectsMask = greenspacesobjectsArea.gte(minsize);
+  var greenspacesobjectsmasked = greenspacesobjects.updateMask(greenspacesobjectsMask);
+  
+  //9. Detect edges of green space objects
+  var canny = ee.Algorithms.CannyEdgeDetector({
+      image: greenspaces, threshold: 1, sigma: 0.1
+  });
+  var hough = ee.Algorithms.HoughTransform(canny, 10, 0.5, 0.5);
+  var edgemask = hough.updateMask(greenspacesobjectsMask);
+ 
+  //10. Detect surrounding urban area
+  var ifurbanneighbors = urbanareas.neighborhoodToBands(ee.Kernel.plus(1));
+  var ifnorthisurban = ifurbanneighbors.select('label_mode_0_1');
+  var ifeastisurban = ifurbanneighbors.select('label_mode_1_0');
+  var ifsouthisurban = ifurbanneighbors.select('label_mode_0_-1');
+  var ifwestisurban = ifurbanneighbors.select('label_mode_-1_0');
+  
+  //11. Mask the existence of urban neighbour by the edge
+  function maskEdgesofObjectsforReducing(img, obj){
+    var EdgeofGreenspacesmasked = img.updateMask(edgemask).addBands(obj.select('labels'));
+    return  EdgeofGreenspacesmasked;
+  }
+  var ifnorthisurbanmasked = maskEdgesofObjectsforReducing(ifnorthisurban, greenspacesobjectsmasked);
+  var ifeastisurbanmasked = maskEdgesofObjectsforReducing(ifeastisurban, greenspacesobjectsmasked);
+  var ifsouthisurbanmasked = maskEdgesofObjectsforReducing(ifsouthisurban, greenspacesobjectsmasked);
+  var ifwestisurbanmasked = maskEdgesofObjectsforReducing(ifwestisurban, greenspacesobjectsmasked);
+  
+  //12. Generate density of urban neighbors along green space edges
+  function getDensityofUrbanNeighbors(img){
+    var clusterhasurbanneighbor = img.reduceConnectedComponents({
+      reducer: ee.Reducer.mean(),
+      labelBand: 'labels'
+    });
+    return clusterhasurbanneighbor;
+  }
+  var northurbanneighborhooddensity = getDensityofUrbanNeighbors(ifnorthisurbanmasked);
+  var easturbanneighborhooddensity = getDensityofUrbanNeighbors(ifeastisurbanmasked);
+  var southurbanneighborhooddensity = getDensityofUrbanNeighbors(ifsouthisurbanmasked);
+  var westurbanneighborhooddensity = getDensityofUrbanNeighbors(ifwestisurbanmasked);
+
+  
+  //13. Filter green spaces based on density of urban areas in edges of green spaces
+  var clusterhasenoughurbanneighbor_north = northurbanneighborhooddensity.gt(neighborhoodthreshold);
+  var clusterhasenoughurbanneighbor_east = easturbanneighborhooddensity.gt(neighborhoodthreshold);
+  var clusterhasenoughurbanneighbor_south = southurbanneighborhooddensity.gt(neighborhoodthreshold);
+  var clusterhasenoughurbanneighbor_west = westurbanneighborhooddensity.gt(neighborhoodthreshold);
+  var urbangreenspacesmask = (clusterhasenoughurbanneighbor_north.and(clusterhasenoughurbanneighbor_east).and(clusterhasenoughurbanneighbor_south))
+                          .or(clusterhasenoughurbanneighbor_north.and(clusterhasenoughurbanneighbor_east).and(clusterhasenoughurbanneighbor_west))
+                          .or(clusterhasenoughurbanneighbor_north.and(clusterhasenoughurbanneighbor_south).and(clusterhasenoughurbanneighbor_west))
+                          .or(clusterhasenoughurbanneighbor_south.and(clusterhasenoughurbanneighbor_east).and(clusterhasenoughurbanneighbor_west));
+  var urbangreenspaces = urbangreenspacesmask.selfMask().rename('urbangreenareas');
+  var urbangreenspacesobjects = greenspacesobjectsmasked.select('labels')
+                                        .updateMask(urbangreenspacesmask);
+  
+  //17. Convert objects to vector
+  var UGSvectors = urbangreenspaces.reduceToVectors({
+    geometry: AOI_geometry,
+    scale: 20,
+    geometryType: 'polygon',
+    labelProperty: 'labels',
+    bestEffort: true
+  });
+  var UGSvectorsgeom = UGSvectors.geometry();
+
+  //18. Display layers
+  var dwLULCVis = {min: 0,  max: 8,
+                palette: ['#419BDF', '#397D49', '#88B053', '#7A87C6',
+                '#E49635', '#DFC35A', '#C4281B', '#A59B8F', '#B39FE1']};
+  var LULClayer = ui.Map.Layer(LULC, dwLULCVis, 'LULC', false); 
+  var UGSlayer = ui.Map.Layer(urbangreenspaces, {palette: '00FF00'}, 'Urban Green Spaces (raster)', false);
+  var UGSobjectslayer = ui.Map.Layer(urbangreenspacesobjects.randomVisualizer(), null, 'Urban Green Spaces Objects', false);
+  var UGSvectorsgeomlayer = ui.Map.Layer(UGSvectorsgeom, {'color': 'green'}, 'Urban Green Spaces (vector)', true);
+  Map.layers().set(0, UGSvectorsgeomlayer);
+  
+  UGSrasterfile = urbangreenspaces;
+  UGSvectorfile = UGSvectors;
+} 
+
+//-----------------Setting the user interface-----------------
+//Title
+var titlelabel = ui.Label({
+  value: 'THE UGS EXTRACTOR',
+  style: {fontSize: '35px', color: 'green', textAlign: 'center', fontWeight: 'bold'},
+});
+
+//Sub-title
+var subtitlelabel = ui.Label({
+  value: 'A tool for extracting urban green spaces',
+  style: {fontSize: '25px', color: 'green', textAlign: 'center'},
+});
+
+//Blank
+var blanklabel = ui.Label({
+  value: '----------',
+  style: {fontSize: '20px', color: 'white', textAlign: 'center'},
+});
+
+//Instructions
+var instructionslabel = ui.Label('Instructions: Set the date of interest, minimum size of each UGS, urban neighbor density threshold, then draw a rectangle of the area of interest.');
+
+//DateSlider for the date of interest
+var datelabel = ui.Label('Date of Interest:', {fontWeight: 'bold'});
+var DWstart = ee.Image(DWcollection.first()).date().advance(10, 'week');
+var enddate = ee.Date(Date.now()).advance(-8, 'week');
+var dateslider = ui.DateSlider({
+    start: DWstart,
+    end: enddate,
+    value: enddate,
+    period: 1,
+    style: {width: '180px', position: 'top-center'}
+  });
+
+//Slider for the minimum size
+var sizelabel = ui.Label('Minimum size of each UGS (square meters):', {fontWeight: 'bold'});
+var sizeslider = ui.Slider({
+  value: 3000,
+  min: 3000,
+  max: 50000,
+  step: 1000
+});
+
+//Slider for the neighborhood density slider
+var thresholdlabel = ui.Label('Urban Neighbor Density Threshold:', {fontWeight: 'bold'});
+var thresholdslider = ui.Slider({
+  value: 0.1,
+  min: 0.1,
+  max: 0.5,
+  step: 0.05
+});
+
+//Button for downloading the UGS vector files
+var downloadvectorbutton = ui.Button({
+  label: 'Download the UGS vector file',
+  onClick: function() {
+    var downloadArgs = {
+      format: 'json',
+      filename: 'UGSvectordata'
+    };
+    var url = UGSvectorfile.getDownloadURL(downloadArgs);
+    downloadvectorlabel.setUrl(url);
+    downloadvectorlabel.style().set({shown: true});
+  }
+});
+downloadvectorbutton.style().set('shown', false);
+var downloadvectorlabel = ui.Label('Download the UGS vector file', {shown: false});
+
+//What happens after drawing a rectangle
+function afterondraw(geometry){
+  mapUGS(geometry, 
+        ee.Date(dateslider.getValue()[0]),
+        sizeslider.getValue(),
+        thresholdslider.getValue());
+  downloadvectorbutton.style().set('shown', true);
+  restartbutton.style().set('shown', true); 
+}
+
+
+//Button for restarting
+var restartbutton = ui.Button({
+  label: 'Restart mapping',
+  onClick: function() {
+    Map.drawingTools().clear();
+    Map.drawingTools().setLinked(false);
+    Map.drawingTools().setDrawModes(['rectangle']);
+    Map.drawingTools().addLayer([]);
+    //Map.drawingTools().setShape('rectangle');
+    //Map.drawingTools().draw();
+    Map.drawingTools().onDraw(function (geometry) {
+      afterondraw(geometry);
+    });
+    downloadvectorbutton.style().set('shown', false);
+    downloadvectorlabel.style().set('shown', false);
+    restartbutton.style().set('shown', false);
+    Map.remove(Map.layers().get(0));
+  }
+});
+restartbutton.style().set('shown', false);
+
+//The right panel for arranging the widgets
+var panel = ui.Panel({style: {width: '350px', position: 'top-center'}});
+panel.widgets().set(1, titlelabel);
+panel.widgets().set(2, subtitlelabel);
+panel.widgets().set(3, blanklabel);
+panel.widgets().set(4, instructionslabel);
+panel.widgets().set(5, datelabel);
+panel.widgets().set(6, dateslider);
+panel.widgets().set(7, sizelabel);
+panel.widgets().set(8, sizeslider);
+panel.widgets().set(9, thresholdlabel);
+panel.widgets().set(10, thresholdslider);
+panel.widgets().set(11, downloadvectorbutton);
+panel.widgets().set(12, restartbutton);
+panel.widgets().set(13, downloadvectorlabel);
+
+
+//For drawing the rectangle
+Map.drawingTools().setLinked(false);
+Map.drawingTools().setDrawModes(['rectangle']);
+Map.drawingTools().addLayer({geometries:[], color: 'white'});
+//Map.drawingTools().setShape('rectangle');
+//Map.drawingTools().draw();
+Map.drawingTools().onDraw(function (geometry) {
+  afterondraw(geometry);
+});
+
+// Add the panel to the ui.root.
+ui.root.add(panel);
+//Map.add(panel);
